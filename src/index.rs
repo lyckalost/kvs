@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs::{File};
-use crate::{KvError};
+use crate::{KvError, Command};
 use std::io::Read;
 
+#[derive(Debug)]
 pub struct Index {
     data_index: HashMap<String, LogPointer>
 }
 
+#[derive(Debug)]
 pub struct LogPointer {
     pub start_pos: u64,
     pub record_size: usize,
@@ -35,6 +37,8 @@ impl Index {
         let mut f = File::open(pathbuf)?;
         let mut record_size_buf = (0 as usize).to_be_bytes();
 
+        let mut total_bytes_now: u64 = 0;
+
         // here we tries to borrow from read_exact
         // if we can't read any number we consider this as done
         loop {
@@ -54,11 +58,21 @@ impl Index {
                 return Err(KvError {details : "error setting up index".to_owned()});
             }
 
-            f.read_exact(&mut record_size_buf)?;
+            // f.read_exact(&mut record_size_buf)?;
             let record_size = usize::from_be_bytes(record_size_buf);
 
             let mut record_buf : Vec<u8> = vec![0; record_size];
             f.read_exact(&mut record_buf)?;
+
+            let serialized = String::from_utf8(record_buf)?;
+            let deserialized: Command = serde_json::from_str(&serialized)?;
+            match &deserialized.op[..] {
+                "set" => { self.update_index(deserialized.k,
+                                             LogPointer::new(total_bytes_now, record_size, pathbuf.clone()));}
+                "rm" => { self.delete_index(&deserialized.k); }
+                _ =>  { return Err(KvError { details: "Unknown operation in log".to_owned() }); }
+            }
+            total_bytes_now += (record_size + record_size_buf.len()) as u64;
         }
     }
 
@@ -66,7 +80,11 @@ impl Index {
         self.data_index.insert(key, log_pointer);
     }
 
-    pub fn get_log_pointer(&self, key: String) -> Option<&LogPointer>{
-        self.data_index.get(&key)
+    pub fn delete_index(&mut self, key: &String) {
+        self.data_index.remove(key);
+    }
+
+    pub fn get_log_pointer(&self, key: &String) -> Option<&LogPointer>{
+        self.data_index.get(key)
     }
 }

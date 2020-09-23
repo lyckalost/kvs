@@ -18,9 +18,19 @@ pub struct KvStore {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Command {
-    op: String,
-    k: String,
-    v: String,
+    pub op: String,
+    pub k: String,
+    pub v: String,
+}
+
+impl Command {
+    pub fn new(op: String, k: String, v: String) -> Command {
+        Command {
+            op,
+            k,
+            v
+        }
+    }
 }
 
 // define our own error type
@@ -58,7 +68,13 @@ pub type Result<T> = std::result::Result<T, KvError>;
 impl KvStore {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let path_buf = path.into();
+        let mut path_buf = path.into();
+        path_buf.push("kv.dat");
+
+        if !path_buf.exists() {
+            File::create(path_buf.clone())?;
+        }
+
         let f_append = OpenOptions::new().append(true).open(path_buf.clone())?;
         let f_read = OpenOptions::new().read(true).open(path_buf.clone())?;
 
@@ -77,11 +93,7 @@ impl KvStore {
 impl KvStore {
     // get is get(&K, &V) just in case of ownership transfer
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        // match self.store.get(&key) {
-        //     Some(s) => Ok(Some(String::clone(s))),
-        //     None => Ok(None),
-        // }
-        match self.index.get_log_pointer(key) {
+        match self.index.get_log_pointer(&key) {
             None => Ok(None),
             Some(lp) => {
                 // start pos shift by record size padding
@@ -91,7 +103,8 @@ impl KvStore {
                 self.f_read.read_exact(&mut buf)?;
 
                 let serialized = String::from_utf8(buf)?;
-                Ok(serde_json::from_str(&serialized)?)
+                let deserialized: Command = serde_json::from_str(&serialized)?;
+                Ok(Some(deserialized.v))
             }
         }
     }
@@ -122,18 +135,25 @@ impl KvStore {
 
     // &K just in case of ownership transfer
     pub fn remove(&mut self, key: String) -> Result<()> {
-        let serialized = serde_json::to_string(&Command {op: "rm".to_owned(), k: key.clone(), v: String::new()})?;
-        let record_size = serialized.as_bytes().len();
+        // if key does not exist do nothing
+        match self.index.get_log_pointer(&key) {
+            None => {
+                println!("Key not found");
+                Err(KvError { details: "Key not found".to_owned() })
+            },
+            Some(_) => {
+                let serialized = serde_json::to_string(&Command {op: "rm".to_owned(), k: key.clone(), v: String::new()})?;
+                let record_size = serialized.as_bytes().len();
 
-        let size_buf = record_size.to_be_bytes();
+                let size_buf = record_size.to_be_bytes();
 
-        self.index.update_index(key,
-                                LogPointer::new(self.path.metadata().unwrap().len(), record_size, self.path.clone())
-        );
+                self.index.delete_index(&key);
 
-        self.f_append.write_all(&size_buf)?;
-        self.f_append.write_all(serialized.as_bytes())?;
+                self.f_append.write_all(&size_buf)?;
+                self.f_append.write_all(serialized.as_bytes())?;
 
-        Ok(())
+                Ok(())
+            }
+        }
     }
 }
