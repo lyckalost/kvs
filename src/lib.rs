@@ -3,17 +3,27 @@ mod index;
 
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
-use crate::index::{LogPointer, Index};
-use std::fs::{File, OpenOptions};
-use std::io::{Write, Seek, SeekFrom, Read};
+use crate::index::Index;
 use serde_json;
-use std::mem;
+use crate::storage::{LevelStorage};
 
 pub struct KvStore {
     index: Index,
-    path: PathBuf,
-    f_append : File,
-    f_read: File,
+    storage: LevelStorage,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Sequencer {
+    timestamp: u128
+}
+
+impl Sequencer {
+
+    pub fn new(timestamp: u128) -> Sequencer {
+        Sequencer {
+            timestamp
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -21,14 +31,16 @@ pub struct Command {
     pub op: String,
     pub k: String,
     pub v: String,
+    pub sequencer: Sequencer,
 }
 
 impl Command {
-    pub fn new(op: String, k: String, v: String) -> Command {
+    pub fn new(op: String, k: String, v: String, sequencer: Sequencer) -> Command {
         Command {
             op,
             k,
-            v
+            v,
+            sequencer,
         }
     }
 }
@@ -68,24 +80,18 @@ pub type Result<T> = std::result::Result<T, KvError>;
 impl KvStore {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let mut path_buf = path.into();
-        path_buf.push("kv.dat");
+        let work_path = path.into();
 
-        if !path_buf.exists() {
-            File::create(path_buf.clone())?;
-        }
-
-        let f_append = OpenOptions::new().append(true).open(path_buf.clone())?;
-        let f_read = OpenOptions::new().read(true).open(path_buf.clone())?;
+        let mut storage = LevelStorage::new(work_path.clone())?;
+        storage.compaction_after_load()?;
 
         let mut index = Index::new();
-        index.initialize(&path_buf)?;
+        index.initialize(&storage.append_f_path)?;
+
 
         Ok(KvStore {
             index,
-            path: path_buf.clone(),
-            f_append,
-            f_read,
+            storage,
         })
     }
 }
@@ -96,13 +102,7 @@ impl KvStore {
         match self.index.get_log_pointer(&key) {
             None => Ok(None),
             Some(lp) => {
-                // start pos shift by record size padding
-                self.f_read.seek(SeekFrom::Start(lp.start_pos + mem::size_of::<usize>() as u64))?;
-                let mut buf: Vec<u8> = vec![0; lp.record_size];
-
-                self.f_read.read_exact(&mut buf)?;
-
-                let serialized = String::from_utf8(buf)?;
+                let serialized = self.storage.get(lp)?;
                 let deserialized: Command = serde_json::from_str(&serialized)?;
                 Ok(Some(deserialized.v))
             }
@@ -111,24 +111,10 @@ impl KvStore {
 
     // for set, K,V ownership is transferred to store
     pub fn set(&mut self, key: String, value: String) -> Result<()>{
-        let serialized = serde_json::to_string(&Command {op: "set".to_owned(), k: key.clone(), v: value})?;
-        let record_size = serialized.as_bytes().len();
+        let serialized = serde_json::to_string(&Command {op: "set".to_owned(), k: key.clone(), v: value, sequencer: Sequencer::new(0)})?;
 
-        let size_buf = record_size.to_be_bytes();
-
-        // let's just use self.path.metadata() here, not quite sure the best way to do
-        // this is not good because 1) the system overhead might be large 2) the metadata might not be updated since write is buffered not flushed
-        // 3) consitency issue
-        // another way I could think of is to keep a u64 of file size in KvStore, this is not good either, like rebuilding the wheel
-        self.index.update_index(key,
-                                LogPointer::new(self.path.metadata().unwrap().len(), record_size, self.path.clone())
-        );
-
-        // self.index.update_index(key.clone(), self.path.clone(),
-        //                         self.path.metadata().unwrap().len(), record_size);
-
-        self.f_append.write_all(&size_buf)?;
-        self.f_append.write_all(serialized.as_bytes())?;
+        let log_pointer = self.storage.update(serialized)?;
+        self.index.update_index(key,log_pointer);
 
         Ok(())
     }
@@ -142,15 +128,9 @@ impl KvStore {
                 Err(KvError { details: "Key not found".to_owned() })
             },
             Some(_) => {
-                let serialized = serde_json::to_string(&Command {op: "rm".to_owned(), k: key.clone(), v: String::new()})?;
-                let record_size = serialized.as_bytes().len();
-
-                let size_buf = record_size.to_be_bytes();
-
+                let serialized = serde_json::to_string(&Command {op: "rm".to_owned(), k: key.clone(), v: String::new(), sequencer : Sequencer::new(0)})?;
+                self.storage.update(serialized)?;
                 self.index.delete_index(&key);
-
-                self.f_append.write_all(&size_buf)?;
-                self.f_append.write_all(serialized.as_bytes())?;
 
                 Ok(())
             }

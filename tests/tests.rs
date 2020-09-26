@@ -5,6 +5,7 @@ use predicates::str::{contains, is_empty, PredicateStrExt};
 use std::process::Command;
 use tempfile::TempDir;
 use walkdir::WalkDir;
+use std::path::Path;
 
 // `kvs` with no args should exit with a non-zero code.
 #[test]
@@ -258,11 +259,12 @@ fn remove_key() -> Result<()> {
 // Test data correctness after compaction.
 #[test]
 fn compaction() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = KvStore::open(temp_dir.path())?;
+    // let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let p = Path::new("/Users/junwow/myGT/2020/TP201/kvs");
+    let mut store = KvStore::open(p)?;
 
     let dir_size = || {
-        let entries = WalkDir::new(temp_dir.path()).into_iter();
+        let entries = WalkDir::new(p).into_iter();
         let len: walkdir::Result<u64> = entries
             .map(|res| {
                 res.and_then(|entry| entry.metadata())
@@ -273,8 +275,8 @@ fn compaction() -> Result<()> {
     };
 
     let mut current_size = dir_size();
-    for iter in 0..1000 {
-        for key_id in 0..1000 {
+    for iter in 0..100 {
+        for key_id in 0..100 {
             let key = format!("key{}", key_id);
             let value = format!("{}", iter);
             store.set(key, value)?;
@@ -289,8 +291,8 @@ fn compaction() -> Result<()> {
 
         drop(store);
         // reopen and check content.
-        let mut store = KvStore::open(temp_dir.path())?;
-        for key_id in 0..1000 {
+        let mut store = KvStore::open(p)?;
+        for key_id in 0..100 {
             let key = format!("key{}", key_id);
             assert_eq!(store.get(key)?, Some(format!("{}", iter)));
         }

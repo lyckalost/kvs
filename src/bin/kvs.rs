@@ -1,34 +1,6 @@
 use std::env;
 use std::env::Args;
-use kvs::{KvStore, Command};
-
-// fn handle_get_or_rm(args: &mut Args) -> String{
-//     match args.next() {
-//         Some(k) => { // checking Key
-//             match args.next() {
-//                 None => panic!("unimplemented"),
-//                 Some(_) => panic!("Extra Arguments!")
-//             }
-//             k
-//         },
-//         None => panic!("Key not set!")
-//     }
-// }
-//
-// fn handle_set(args: &mut Args) {
-//     match args.next() {
-//         Some(_) => { // checking Key
-//             match args.next() { // checking Value
-//                 None => panic!("Value not set!"),
-//                 Some(_) => match args.next() {
-//                     None => panic!("unimplemented"),
-//                     Some(_) => panic!("Extra Arguments!")
-//                 }
-//             }
-//         },
-//         None => panic!("Key not set!")
-//     }
-// }
+use kvs::{KvStore, Command, Sequencer};
 
 fn get_cmd(args: &mut Args, op: String) -> Command {
     let k = args.next().unwrap();
@@ -36,7 +8,7 @@ fn get_cmd(args: &mut Args, op: String) -> Command {
     let cmd = match args.next() {
         None => {
             if op.eq("get") || op.eq("rm") {
-                Command::new(op, k, "".to_owned())
+                Command::new(op, k, "".to_owned(), Sequencer::new(0))
             } else {
                 panic!("Value not set!");
             }
@@ -45,7 +17,7 @@ fn get_cmd(args: &mut Args, op: String) -> Command {
             if op.eq("get") || op.eq("rm") {
                 panic!("Extra Arguments!")
             } else {
-                Command::new(op, k, v)
+                Command::new(op, k, v, Sequencer::new(0))
             }
         }
     };
@@ -66,7 +38,8 @@ fn main() {
     }
 
     args.next();
-    let mut store = KvStore::open("./").unwrap();
+
+    let mut store = KvStore::open(env::current_dir().unwrap()).unwrap();
 
     let cmd = match args.next() {
         Some(s) => {
