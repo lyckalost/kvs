@@ -1,5 +1,5 @@
 use assert_cmd::prelude::*;
-use kvs::{KvStore, Result};
+use kvs::{KvStore, Result, Storage};
 use predicates::ord::eq;
 use predicates::str::{contains, is_empty, PredicateStrExt};
 use std::process::Command;
@@ -11,6 +11,19 @@ use std::path::Path;
 #[test]
 fn cli_no_args() {
     Command::cargo_bin("kvs").unwrap().assert().failure();
+}
+
+#[test]
+fn storage_set() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut storage = Storage::new(&temp_dir.path().to_path_buf()).unwrap();
+    let seq = kvs::Sequencer::new().unwrap();
+    let cmd = kvs::Command::Set {key: "key1".to_owned(), value: "value1".to_owned(), sequencer: seq};
+    let expected = cmd.clone();
+
+    let lp = storage.mutate(cmd).unwrap();
+
+    assert_eq!(expected, storage.get(&lp).unwrap());
 }
 
 // `kvs -V` should print the version
