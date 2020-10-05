@@ -1,5 +1,5 @@
 use assert_cmd::prelude::*;
-use kvs::{KvStore, Result, Storage};
+use kvs::{KvStore, Result, Storage, Index, LogPointer, FileId, KvError};
 use predicates::ord::eq;
 use predicates::str::{contains, is_empty, PredicateStrExt};
 use std::process::Command;
@@ -24,6 +24,60 @@ fn storage_set() {
     let lp = storage.mutate(cmd).unwrap();
 
     assert_eq!(expected, storage.get(&lp).unwrap());
+}
+
+#[test]
+fn storage_build_index() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut storage = Storage::new(&temp_dir.path().to_path_buf()).unwrap();
+    let seq1 = kvs::Sequencer::new().unwrap();
+    let cmd1 = kvs::Command::Set {key: "key1".to_owned(), value: "value1".to_owned(), sequencer: seq1};
+    let lp1 = storage.mutate(cmd1).unwrap();
+
+    let seq2 = kvs::Sequencer::new().unwrap();
+    let cmd2 = kvs::Command::Set {key: "key2".to_owned(), value: "value2".to_owned(), sequencer: seq2};
+    let lp2 = storage.mutate(cmd2).unwrap();
+
+    let mut index = Index::new();
+
+    storage.build_index(&mut index);
+
+    assert_eq!(lp1, index.get_index(&"key1".to_owned()).unwrap());
+    assert_eq!(lp2, index.get_index(&"key2".to_owned()).unwrap());
+}
+
+#[test]
+fn index_update() {
+    let mut index = Index::new();
+
+    let seq1 = kvs::Sequencer::new().unwrap();
+    let cmd1 = kvs::Command::Set {key: "key1".to_owned(), value: "value1".to_owned(), sequencer: seq1};
+    let lp1 = LogPointer {start_pos: 0, len: 1, f_id: FileId {id: 0}};
+    let expected = lp1.clone();
+    index.update_index(&cmd1, lp1);
+
+    assert_eq!(expected, index.get_index(cmd1.get_key()).unwrap())
+}
+
+#[test]
+fn index_update_conflict() {
+    let mut index = Index::new();
+
+    let seq1 = kvs::Sequencer::new().unwrap();
+    let seq2 = kvs::Sequencer::new().unwrap();
+
+    let cmd1 = kvs::Command::Set {key: "key1".to_owned(), value: "value1".to_owned(), sequencer: seq2};
+    let cmd2 = kvs::Command::Set {key: "key1".to_owned(), value: "value2".to_owned(), sequencer: seq1};
+    let lp1 = LogPointer {start_pos: 0, len: 1, f_id: FileId {id: 0}};
+    let lp2 = LogPointer {start_pos: 2, len: 3, f_id: FileId {id: 0}};
+
+    index.update_index(&cmd1, lp1);
+
+    // need to find out a way to get rid of this ugly assert
+    match index.update_index(&cmd2, lp2) {
+        Err(KvError) => {}
+        _ => {assert!(false)}
+    }
 }
 
 // `kvs -V` should print the version

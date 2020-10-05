@@ -1,4 +1,4 @@
-use crate::{Result, KvError};
+use crate::{Result, KvError, Index};
 use crate::store::{Command, Sequencer};
 use std::path::{PathBuf, Path};
 use std::fs;
@@ -10,7 +10,9 @@ use failure::_core::fmt::Formatter;
 use std::ffi::OsStr;
 use failure::_core::cmp::Ordering;
 use std::collections::HashMap;
+use serde_json::Deserializer;
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogPointer {
     pub start_pos: u64,
     pub len: u64,
@@ -63,6 +65,25 @@ impl Storage {
             Err(KvError::KeyNotFound)
         }
 
+    }
+
+    pub fn build_index(&mut self, index: &mut Index) -> Result<()> {
+        for (f_id, reader) in self.readers.iter_mut() {
+            let mut pos = reader.seek(SeekFrom::Start(0))?;
+
+            // WTF! How can this reader ref get into that Deserializer::from_reader
+            // not 100% percent sure, but maybe related to how the trait is defined for references
+            // https://stackoverflow.com/questions/44928882/why-do-i-get-the-error-the-trait-foo-is-not-implemented-for-mut-t-even-th
+            let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+            while let Some(cmd) = stream.next() {
+                let new_pos = stream.byte_offset() as u64;
+                index.update_index(&cmd?, LogPointer {start_pos: pos, len: new_pos - pos, f_id: f_id.clone()});
+
+                pos = new_pos;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn mutate(&mut self, cmd: Command) -> Result<LogPointer> {
@@ -190,7 +211,7 @@ impl<W: Write + Seek> Seek for BufferedWriterWithPos<W> {
     }
 }
 
-#[derive(Eq, PartialEq, PartialOrd, Hash, Clone)]
+#[derive(Eq, PartialEq, PartialOrd, Hash, Clone, Debug)]
 pub struct FileId {
     pub id: u64
 }

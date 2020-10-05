@@ -18,6 +18,9 @@ pub enum KvError {
 
     #[fail(display = "Invalid argument in the input")]
     InvalidArgument,
+
+    #[fail(display = "Conflicts detected when update")]
+    ConflictError,
 }
 
 impl From<io::Error> for KvError {
