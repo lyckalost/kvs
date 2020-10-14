@@ -19,7 +19,7 @@ impl KvStore {
         let mut storage = Storage::new(&storage_path)?;
 
         let mut index = Index::new();
-        storage.build_index(&mut index);
+        storage.build_index(&mut index)?;
 
         Ok(KvStore {
             path: storage_path.clone(),
@@ -32,7 +32,12 @@ impl KvStore {
         let cmd = Command::Set {key, value, sequencer: Sequencer::new()?};
 
         let log_pointer = self.storage.mutate(cmd.clone())?;
-        self.index.update_index(&cmd, log_pointer)
+        self.index.update_index(&cmd, log_pointer)?;
+
+        if self.storage.should_compaction() {
+            self.storage.compaction(&mut self.index)?;
+        }
+        Ok(())
     }
 
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
@@ -48,11 +53,16 @@ impl KvStore {
     }
 
     pub fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(lp) = self.index.get_index(&key) {
+        if let Some(_) = self.index.get_index(&key) {
             let cmd = Command::Rm {key, sequencer: Sequencer::new()?};
             let log_pointer = self.storage.mutate(cmd.clone())?;
 
-            self.index.update_index(&cmd, log_pointer)
+            self.index.update_index(&cmd, log_pointer)?;
+
+            if self.storage.should_compaction() {
+                self.storage.compaction(&mut self.index)?;
+            }
+            Ok(())
         } else {
             Err(KvError::KeyNotFound)
         }

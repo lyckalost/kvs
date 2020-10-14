@@ -1,7 +1,6 @@
 use std::env;
 use clap::{App, SubCommand, Arg};
 use kvs::{Result, KvError, KvStore};
-use predicates::prelude::predicate::path::exists;
 use std::process::exit;
 
 

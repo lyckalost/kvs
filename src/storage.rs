@@ -9,7 +9,7 @@ use std::fmt::Display;
 use failure::_core::fmt::Formatter;
 use std::ffi::OsStr;
 use failure::_core::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap};
 use serde_json::Deserializer;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,18 +21,20 @@ pub struct LogPointer {
 
 pub struct Storage {
     storage_path: PathBuf,
-    readers: HashMap<FileId, BufferedReaderWithPos<File>>,
+    readers: BTreeMap<FileId, BufferedReaderWithPos<File>>,
     writer: BufferedWriterWithPos<File>,
     current_f_id: FileId,
 }
 
 impl Storage {
+    pub const MAX_LOG_SIZE: u64 = 1024 * 32;
+
     pub fn new(path: &PathBuf) -> Result<Storage> {
         let mut storage_path = path.clone();
         storage_path.push("data");
 
         fs::create_dir_all(&storage_path)?;
-        let mut readers: HashMap<FileId, BufferedReaderWithPos<File>> = HashMap::new();
+        let mut readers: BTreeMap<FileId, BufferedReaderWithPos<File>> = BTreeMap::new();
         let sorted_f_id_l = Storage::sorted_f_id_list(&storage_path)?;
         for f_id in &sorted_f_id_l {
             readers.insert(f_id.clone(),
@@ -77,7 +79,7 @@ impl Storage {
             let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
             while let Some(cmd) = stream.next() {
                 let new_pos = stream.byte_offset() as u64;
-                index.update_index(&cmd?, LogPointer {start_pos: pos, len: new_pos - pos, f_id: f_id.clone()});
+                index.update_index(&cmd?, LogPointer {start_pos: pos, len: new_pos - pos, f_id: f_id.clone()})?;
 
                 pos = new_pos;
             }
@@ -94,11 +96,57 @@ impl Storage {
 
         let new_pos = self.writer.pos;
 
-        Ok(LogPointer {
+        let lp = LogPointer {
             start_pos,
             len: new_pos - start_pos,
             f_id: self.current_f_id.clone()
-        })
+        };
+
+        if new_pos > Storage::MAX_LOG_SIZE {
+            let writer_id = self.current_f_id.inc();
+            let writer = Storage::new_log_file(&writer_id, &self.storage_path, &mut self.readers)?;
+            self.current_f_id = writer_id;
+            self.writer = writer;
+        }
+
+        Ok(lp)
+    }
+
+    pub fn should_compaction(&mut self) -> bool {
+        self.readers.len() > 4
+    }
+
+    pub fn compaction(&mut self, index: &mut Index) -> Result<()> {
+        // should make this async later
+        let stop_f_id = self.current_f_id.clone();
+
+        let writer_id = self.current_f_id.inc();
+        let writer = Storage::new_log_file(&writer_id, &self.storage_path, &mut self.readers)?;
+        self.current_f_id = writer_id;
+        self.writer = writer;
+
+        for (_, v) in index.into_iter() {
+            let lp: &LogPointer = &v.0;
+            let seq: &Sequencer = &v.1;
+            let cmd = self.get(lp)?;
+            let lp_updated = self.mutate(cmd)?;
+
+            // want to get rid of this clone, but seems not possible
+            *v = (lp_updated, seq.clone());
+        }
+
+
+        // clean up old files
+        let sorted_f_id_l = Storage::sorted_f_id_list(&self.storage_path)?;
+        for f_id in sorted_f_id_l {
+            // new files, ignore
+            if f_id.gt(&stop_f_id) {
+                continue;
+            }
+
+            fs::remove_file(Storage::log_path(&f_id, &self.storage_path))?;
+        }
+        Ok(())
     }
 
     fn sorted_f_id_list(path: &Path) -> Result<Vec<FileId>> {
@@ -123,7 +171,7 @@ impl Storage {
     }
 
     fn new_log_file(f_id: &FileId, path: &Path,
-                    readers: &mut HashMap<FileId, BufferedReaderWithPos<File>>) -> Result<BufferedWriterWithPos<File>> {
+                    readers: &mut BTreeMap<FileId, BufferedReaderWithPos<File>>) -> Result<BufferedWriterWithPos<File>> {
         let new_path = Storage::log_path(f_id, path);
 
         let writer = BufferedWriterWithPos::new(
