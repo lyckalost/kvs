@@ -1,69 +1,61 @@
 use std::env;
-use std::env::Args;
-use kvs::{KvStore, Command, Sequencer};
+use clap::{App, SubCommand, Arg};
+use kvs::{Result, KvError, KvStore};
+use std::process::exit;
 
-fn get_cmd(args: &mut Args, op: String) -> Command {
-    let k = args.next().unwrap();
 
-    let cmd = match args.next() {
-        None => {
-            if op.eq("get") || op.eq("rm") {
-                Command::new(op, k, "".to_owned(), Sequencer::new(0))
+fn main() -> Result<()> {
+    let kvs_app = App::new("kvs")
+        .version(env!("CARGO_PKG_VERSION"))
+        .subcommand(
+            SubCommand::with_name("get")
+                .arg(Arg::with_name("<KEY>").help("ENTER A KEY").required(true))
+        )
+        .subcommand(
+            SubCommand::with_name("set")
+                .arg(Arg::with_name("<KEY>").help("ENTER A KEY").required(true))
+                .arg(Arg::with_name("<VALUE>").help("ENTER A VALUE").required(true))
+        )
+        .subcommand(
+            SubCommand::with_name("rm")
+                .arg(Arg::with_name("<KEY>").help("ENTER A KEY").required(true))
+        )
+        .get_matches();
+
+
+
+    match kvs_app.subcommand() {
+        ("get", Some(matches)) =>  {
+            let k = matches.value_of("<KEY>").expect("<KEY> argument is missing");
+            let mut kv = KvStore::open(env::current_dir()?)?;
+
+            if let Some(v) = kv.get(k.to_owned())? {
+                println!("{}", v);
             } else {
-                panic!("Value not set!");
+                println!("Key not found");
             }
-        }
-        Some(v) => {
-            if op.eq("get") || op.eq("rm") {
-                panic!("Extra Arguments!")
-            } else {
-                Command::new(op, k, v, Sequencer::new(0))
-            }
-        }
-    };
-
-    match args.next() {
-        Some(_) => panic!("Extra Arguments!"),
-        None => ()
-    }
-
-    cmd
-}
-
-fn main() {
-    let mut args= env::args();
-
-    if args.len() > 4 {
-        panic!("Too many arguments!")
-    }
-
-    args.next();
-
-    let mut store = KvStore::open(env::current_dir().unwrap()).unwrap();
-
-    let cmd = match args.next() {
-        Some(s) => {
-            match &s[..] {
-                "-V" => {
-                    println!(env!("CARGO_PKG_VERSION"));
-                    None
-                },
-                x if x.eq("get") || x.eq("rm") || x.eq("set") => Some(get_cmd(&mut args, x.to_owned())),
-                _ => panic!("Unknown argument!")
-            }
-        }
-        None => panic!("Missing argument!"),
-    }.unwrap();
-
-    match &cmd.op[..] {
-        "get" => {
-            match store.get(cmd.k).unwrap() {
-                None => println!("Key not found"),
-                Some(v) => println!("{}", v)
-            };
         },
-        "rm" => store.remove(cmd.k).unwrap(),
-        "set" => store.set(cmd.k, cmd.v).unwrap(),
-        _ => panic!("Unknown operation!")
+        ("rm", Some(matches)) => {
+            let k = matches.value_of("<KEY>").expect("<KEY> argument is missing");
+            let mut kv = KvStore::open(env::current_dir()?)?;
+            match kv.remove(k.to_string()) {
+                Ok(()) => (),
+                Err(KvError::KeyNotFound) => {
+                    println!("Key not found");
+                    exit(1);
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        ("set", Some(matches)) => {
+            let k = matches.value_of("<KEY>").expect("<KEY> argument is missing");
+            let v = matches.value_of("<VALUE>").expect("<VALUE> argument is missing");
+
+            let mut kv = KvStore::open(env::current_dir()?)?;
+            kv.set(k.to_owned(), v.to_owned())?;
+        }
+        _ => unreachable!()
     }
+
+    Ok(())
 }

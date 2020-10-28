@@ -1,155 +1,285 @@
-use std::path::PathBuf;
-use crate::{Result};
-use std::{fs, mem};
+use crate::{Result, KvError, Index};
+use crate::store::{Command, Sequencer};
+use std::path::{PathBuf, Path};
+use std::fs;
 use std::fs::{File, OpenOptions};
-use walkdir::{WalkDir};
-use std::collections::HashMap;
-use std::io::{SeekFrom, Seek, Read, Write};
-use crate::index::Index;
+use std::io;
+use std::io::{Read, Seek, BufReader, SeekFrom, Write, BufWriter};
+use std::fmt::Display;
+use failure::_core::fmt::Formatter;
+use std::ffi::OsStr;
+use failure::_core::cmp::Ordering;
+use std::collections::{BTreeMap};
+use serde_json::Deserializer;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogPointer {
     pub start_pos: u64,
-    pub record_size: usize,
-    pub path: PathBuf
+    pub len: u64,
+    pub f_id: FileId,
 }
 
-impl LogPointer {
-    pub fn new(start_pos: u64, record_size: usize, path: PathBuf) -> LogPointer {
-        LogPointer {
-            start_pos,
-            record_size,
-            path
-        }
-    }
+pub struct Storage {
+    storage_path: PathBuf,
+    readers: BTreeMap<FileId, BufferedReaderWithPos<File>>,
+    writer: BufferedWriterWithPos<File>,
+    current_f_id: FileId,
 }
 
-pub struct LevelStorage{
-    f_readers: HashMap<PathBuf, File>,
+impl Storage {
+    pub const MAX_LOG_SIZE: u64 = 1024 * 32;
 
-    f_appender: File,
-    pub append_f_path: PathBuf,
-}
-
-impl LevelStorage {
-    // pub const LEVEL_F_NUM: u32 = 8;
-    // pub const LEVEL_NUM: u32 = 4;
-    // // max file size 4k at level 0, 8k at level 1...
-    // pub const LEVEL_ZERO_SIZE: u32 = 1024 * 4;
-    // pub const FACTOR: u32 = 2;
-
-    pub fn new(path: PathBuf) -> Result<LevelStorage> {
+    pub fn new(path: &PathBuf) -> Result<Storage> {
         let mut storage_path = path.clone();
         storage_path.push("data");
 
-        if !storage_path.exists() {
-            fs::create_dir(&storage_path)?;
+        fs::create_dir_all(&storage_path)?;
+        let mut readers: BTreeMap<FileId, BufferedReaderWithPos<File>> = BTreeMap::new();
+        let sorted_f_id_l = Storage::sorted_f_id_list(&storage_path)?;
+        for f_id in &sorted_f_id_l {
+            readers.insert(f_id.clone(),
+                           BufferedReaderWithPos::new(
+                               File::open(Storage::log_path(&f_id, &storage_path))?)?
+            );
         }
 
-        let append_f_path = LevelStorage::get_path_of_level(&storage_path, 0)?;
-        let f_appender = OpenOptions::new().append(true).open(&append_f_path)?;
+        let writer_id = sorted_f_id_l.last().unwrap_or(&FileId {id: 0}).inc();
+        let writer = Storage::new_log_file(&writer_id, &storage_path, &mut readers)?;
 
-        Ok(LevelStorage {
-            f_readers: HashMap::new(),
-            f_appender,
-            append_f_path,
+        Ok(Storage {
+            storage_path,
+            readers,
+            writer,
+            current_f_id: writer_id,
         })
     }
 
+    pub fn get(&mut self, lp: &LogPointer) -> Result<Command> {
+        if let Some(reader) = self.readers.get_mut(&lp.f_id) {
+            reader.seek(SeekFrom::Start(lp.start_pos))?;
+            // this is reading from reader with a fixed lenth
+            // when we do loading at start, it is like reading in a stream way
+            let cmd_reader = reader.take(lp.len);
 
-    pub fn get_path_of_level(path: &PathBuf, level: u32) -> Result<PathBuf> {
-        let mut path_level = path.clone();
-
-        path_level.push(level.to_string());
-
-        if !path_level.exists() {
-            fs::create_dir(&path_level)?;
+            let cmd: Command = serde_json::from_reader(cmd_reader)?;
+            Ok(cmd)
+        } else {
+            Err(KvError::KeyNotFound)
         }
 
-        match WalkDir::new(&path_level).min_depth(1).into_iter().last() {
-            Some(res_d) => Ok(res_d.unwrap().into_path()),
-            None => {
-                path_level.push("kv.data");
-                path_level.set_extension(format!("{:08}", 0));
-                File::create(&path_level)?;
-
-                Ok(path_level)
-            }
-        }
     }
 
-    pub fn get(&mut self, lp: &LogPointer) -> Result<String>{
-        let f_read = self.f_readers
-            .entry(lp.path.clone())
-            .or_insert_with(|| {
-                File::open(&lp.path).unwrap()
-            });
+    pub fn build_index(&mut self, index: &mut Index) -> Result<()> {
+        for (f_id, reader) in self.readers.iter_mut() {
+            let mut pos = reader.seek(SeekFrom::Start(0))?;
 
-        f_read.seek(SeekFrom::Start(lp.start_pos + mem::size_of::<usize>() as u64))?;
+            // WTF! How can this reader ref get into that Deserializer::from_reader
+            // not 100% percent sure, but maybe related to how the trait is defined for references
+            // https://stackoverflow.com/questions/44928882/why-do-i-get-the-error-the-trait-foo-is-not-implemented-for-mut-t-even-th
+            let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+            while let Some(cmd) = stream.next() {
+                let new_pos = stream.byte_offset() as u64;
+                index.update_index(&cmd?, LogPointer {start_pos: pos, len: new_pos - pos, f_id: f_id.clone()})?;
 
-        let mut buf: Vec<u8> = vec![0; lp.record_size];
-
-        f_read.read_exact(&mut buf)?;
-
-        let serialized = String::from_utf8(buf)?;
-        Ok(serialized)
-    }
-
-    pub fn update(&mut self, serialized: String) -> Result<LogPointer> {
-        let record_size = serialized.as_bytes().len();
-        let size_buf = record_size.to_be_bytes();
-
-        // let's just use self.path.metadata() here, not quite sure the best way to do
-        // this is not good because 1) the system overhead might be large 2) the metadata might not be updated since write is buffered not flushed
-        // 3) consitency issue
-        // another way I could think of is to keep a u64 of file size in KvStore, this is not good either, like rebuilding the wheel
-        let log_pointer = LogPointer::new(
-            self.append_f_path.metadata().unwrap().len(), record_size,
-            self.append_f_path.clone());
-
-        self.f_appender.write_all(&size_buf)?;
-        self.f_appender.write_all(serialized.as_bytes())?;
-        self.f_appender.flush()?;
-
-        if self.f_appender.metadata().unwrap().len() > 1024 * 256 {
-            self.compaction_after_load()?;
-        }
-
-        Ok(log_pointer)
-    }
-
-    pub fn compaction_after_load(&mut self) -> Result<()> {
-        // new file no need to compaction
-        if self.append_f_path.metadata().unwrap().len() == 0 {
-            return Ok(());
-        }
-
-        let v = self.append_f_path.extension().unwrap()
-            .to_str().unwrap()
-            .parse::<u32>().unwrap();
-
-        let mut index = Index::new();
-        index.initialize(&self.append_f_path)?;
-
-        self.append_f_path.set_extension(format!("{:08}", v + 1));
-        File::create(&self.append_f_path)?;
-
-        self.f_appender = OpenOptions::new().append(true).open(&self.append_f_path).unwrap();
-
-        for (_, (_, v)) in index.into_iter().enumerate() {
-            let serialized = self.get(&v).unwrap();
-
-            // writing to new appender
-            self.update(serialized)?;
-        }
-
-        for path_r in self.f_readers.keys() {
-            if !path_r.eq(&self.append_f_path) {
-                fs::remove_file(path_r)?;
+                pos = new_pos;
             }
         }
 
-        self.f_readers.clear();
         Ok(())
+    }
+
+    pub fn mutate(&mut self, cmd: Command) -> Result<LogPointer> {
+        let start_pos = self.writer.pos;
+
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+
+        let new_pos = self.writer.pos;
+
+        let lp = LogPointer {
+            start_pos,
+            len: new_pos - start_pos,
+            f_id: self.current_f_id.clone()
+        };
+
+        if new_pos > Storage::MAX_LOG_SIZE {
+            let writer_id = self.current_f_id.inc();
+            let writer = Storage::new_log_file(&writer_id, &self.storage_path, &mut self.readers)?;
+            self.current_f_id = writer_id;
+            self.writer = writer;
+        }
+
+        Ok(lp)
+    }
+
+    pub fn should_compaction(&mut self) -> bool {
+        self.readers.len() > 4
+    }
+
+    pub fn compaction(&mut self, index: &mut Index) -> Result<()> {
+        // should make this async later
+        let stop_f_id = self.current_f_id.clone();
+
+        let writer_id = self.current_f_id.inc();
+        let writer = Storage::new_log_file(&writer_id, &self.storage_path, &mut self.readers)?;
+        self.current_f_id = writer_id;
+        self.writer = writer;
+
+        for (_, v) in index.into_iter() {
+            let lp: &LogPointer = &v.0;
+            let seq: &Sequencer = &v.1;
+            let cmd = self.get(lp)?;
+            let lp_updated = self.mutate(cmd)?;
+
+            // want to get rid of this clone, but seems not possible
+            *v = (lp_updated, seq.clone());
+        }
+
+
+        // clean up old files
+        let sorted_f_id_l = Storage::sorted_f_id_list(&self.storage_path)?;
+        for f_id in sorted_f_id_l {
+            // new files, ignore
+            if f_id.gt(&stop_f_id) {
+                continue;
+            }
+
+            fs::remove_file(Storage::log_path(&f_id, &self.storage_path))?;
+        }
+        Ok(())
+    }
+
+    fn sorted_f_id_list(path: &Path) -> Result<Vec<FileId>> {
+        let mut f_id_list: Vec<FileId> = fs::read_dir(&path)?
+            .flat_map(|res| -> Result<_> { Ok(res?.path()) })
+            .filter(|path| path.is_file() && path.extension() == Some("dat".as_ref()))
+            .flat_map(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .map(|s| s.trim_end_matches(".dat"))
+                    .map(|s| s.parse::<u64>().and_then(|id| Ok(FileId {id})))
+            })
+            .flatten()
+            .collect();
+
+        f_id_list.sort_unstable();
+        Ok(f_id_list)
+    }
+
+    fn log_path(f_id: &FileId, path: &Path) -> PathBuf {
+        path.join(format!("{}.dat", f_id))
+    }
+
+    fn new_log_file(f_id: &FileId, path: &Path,
+                    readers: &mut BTreeMap<FileId, BufferedReaderWithPos<File>>) -> Result<BufferedWriterWithPos<File>> {
+        let new_path = Storage::log_path(f_id, path);
+
+        let writer = BufferedWriterWithPos::new(
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&new_path)?
+        )?;
+
+        readers.insert(f_id.clone(), BufferedReaderWithPos::new(File::open(&new_path)?)?);
+
+        Ok(writer)
+    }
+}
+
+struct BufferedReaderWithPos<R: Read + Seek> {
+    reader: BufReader<R>,
+    pos: u64,
+}
+
+impl<R: Read + Seek> BufferedReaderWithPos<R> {
+    pub fn new(mut inner: R) -> io::Result<Self> {
+        inner.seek(SeekFrom::Start(0))?;
+
+        Ok(BufferedReaderWithPos {
+            reader: BufReader::new(inner),
+            pos: 0,
+        })
+    }
+}
+
+impl<R: Read + Seek> Read for BufferedReaderWithPos<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.reader.read(buf)?;
+        self.pos += len as u64;
+
+        Ok(len)
+    }
+}
+
+impl<R: Read + Seek> Seek for BufferedReaderWithPos<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = self.reader.seek(pos)?;
+        Ok(new_pos)
+    }
+}
+
+struct BufferedWriterWithPos<W: Write + Seek> {
+    writer: BufWriter<W>,
+    pos: u64,
+}
+
+impl<W: Write + Seek> BufferedWriterWithPos<W> {
+    pub fn new(mut inner: W) -> io::Result<Self> {
+        inner.seek(SeekFrom::Start(0))?;
+
+        Ok(
+            BufferedWriterWithPos {
+                writer: BufWriter::new(inner),
+                pos: 0,
+            }
+        )
+    }
+}
+
+impl<W: Write + Seek> Write for BufferedWriterWithPos<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = self.writer.write(buf)?;
+        self.pos += len as u64;
+
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write + Seek> Seek for BufferedWriterWithPos<W> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = self.writer.seek(pos)?;
+
+        Ok(new_pos)
+    }
+}
+
+#[derive(Eq, PartialEq, PartialOrd, Hash, Clone, Debug)]
+pub struct FileId {
+    pub id: u64
+}
+
+impl FileId {
+    pub fn inc(&self) -> FileId {
+        FileId {
+            id: self.id + 1
+        }
+    }
+}
+
+impl Display for FileId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08}", self.id)
+    }
+}
+
+impl Ord for FileId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
     }
 }
